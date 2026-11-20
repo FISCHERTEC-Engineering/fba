@@ -26,6 +26,9 @@
     "typescript": "^5.8.0"
   },
   "overrides": {
+    "@prisma/config": {
+      "effect": "3.22.1"
+    },
     "deepmerge-ts": "^8.0.0",
     "postcss": "^8.5.32"
   }
