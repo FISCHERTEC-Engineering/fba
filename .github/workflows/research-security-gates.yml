@@ -1,0 +1,128 @@
+name: Research security gates
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-trust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify policy test fixtures
+        run: python3 scripts/security/ci_workflow_guard.py --self-test
+      - name: Inventory workflow permissions and block unsafe workflow changes
+        env:
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_BEFORE_SHA: ${{ github.event.before }}
+        run: python3 scripts/security/ci_workflow_guard.py
+      - name: Save workflow trust report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: workflow-trust-report
+          path: security-evidence/workflow-trust.json
+          if-no-files-found: error
+          retention-days: 14
+
+  dependency-evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - name: Produce CycloneDX SBOM from exact lockfile without running package scripts
+        run: |
+          set -euo pipefail
+          test -f package-lock.json
+          mkdir -p security-evidence
+          npm sbom --package-lock-only --sbom-format cyclonedx > security-evidence/sbom.cdx.json
+          python3 - <<'PY'
+          import json
+          with open('security-evidence/sbom.cdx.json', encoding='utf-8') as stream:
+              sbom = json.load(stream)
+          assert sbom.get('bomFormat') == 'CycloneDX'
+          assert isinstance(sbom.get('components'), list) and sbom['components']
+          print('CycloneDX SBOM contains', len(sbom['components']), 'components')
+          PY
+      - name: Inventory install scripts, package provenance and insecure HTTP dependencies
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          from urllib.parse import urlsplit
+          lock = json.loads(Path('package-lock.json').read_text(encoding='utf-8'))
+          packages = lock.get('packages')
+          if not isinstance(packages, dict) or not packages:
+              raise SystemExit('Missing resolved package-lock package inventory')
+          scripts, external, insecure, missing_integrity = [], [], [], []
+          for path, item in packages.items():
+              if not path.startswith('node_modules/') or not isinstance(item, dict):
+                  continue
+              if item.get('hasInstallScript'):
+                  scripts.append(path)
+              resolved = item.get('resolved', '')
+              if not isinstance(resolved, str) or not resolved:
+                  continue
+              if resolved.startswith('http://'):
+                  insecure.append({'package': path, 'source': resolved})
+              elif resolved.startswith('https://'):
+                  if urlsplit(resolved).hostname != 'registry.npmjs.org':
+                      external.append({'package': path, 'source': resolved})
+                  if not item.get('integrity'):
+                      missing_integrity.append(path)
+              else:
+                  external.append({'package': path, 'source': resolved})
+          report = {'total_packages': len(packages), 'install_scripts': sorted(scripts),
+                    'nonstandard_sources': external, 'insecure_http_sources': insecure,
+                    'missing_https_integrity': sorted(missing_integrity)}
+          Path('security-evidence/dependency-behavior.json').write_text(
+              json.dumps(report, indent=2, sort_keys=True) + '\n', encoding='utf-8')
+          print(f"Inventory: {len(packages)} packages, {len(scripts)} install scripts, "
+                f"{len(external)} nonstandard sources, {len(insecure)} HTTP sources, "
+                f"{len(missing_integrity)} HTTPS entries without integrity metadata")
+          if insecure:
+              raise SystemExit('Unencrypted HTTP package sources are not allowed')
+          PY
+      - name: Audit all locked dependencies including dev (fail on high and critical)
+        env:
+          npm_config_audit: 'true'
+        run: npm audit --package-lock-only --include=dev --audit-level=high --json > security-evidence/npm-audit.json
+      - name: Summarize audit findings without suppressing failures
+        if: always()
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          path = Path('security-evidence/npm-audit.json')
+          if not path.exists():
+              print('No audit report was generated; prior step must be investigated')
+          else:
+              report = json.loads(path.read_text(encoding='utf-8'))
+              print('Audit counts:', report.get('metadata', {}).get('vulnerabilities', {}))
+              for package, item in sorted(report.get('vulnerabilities', {}).items()):
+                  if item.get('severity') in ('high', 'critical'):
+                      print('HIGH/CRITICAL:', package, '-', item['severity'])
+              if report.get('error'):
+                  print('Audit service or response error:', report['error'].get('code', 'unknown'))
+          PY
+      - name: Save audit and SBOM as security evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-evidence
+          path: security-evidence/
+          if-no-files-found: warn
+          retention-days: 14
