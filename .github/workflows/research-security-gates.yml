@@ -1,0 +1,71 @@
+name: Research security gates
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workflow-trust:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify policy test fixtures
+        run: python3 scripts/security/ci_workflow_guard.py --self-test
+      - name: Inventory workflow permissions and block unsafe workflow changes
+        env:
+          GITHUB_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          GITHUB_BEFORE_SHA: ${{ github.event.before }}
+        run: python3 scripts/security/ci_workflow_guard.py
+      - name: Save workflow trust report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: workflow-trust-report
+          path: security-evidence/workflow-trust.json
+          if-no-files-found: error
+          retention-days: 14
+
+  dependency-evidence:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '22'
+      - name: Produce CycloneDX SBOM from exact lockfile without running package scripts
+        run: |
+          set -euo pipefail
+          test -f package-lock.json
+          mkdir -p security-evidence
+          npm sbom --package-lock-only --sbom-format cyclonedx > security-evidence/sbom.cdx.json
+          python3 - <<'PY'
+          import json
+          with open('security-evidence/sbom.cdx.json', encoding='utf-8') as stream:
+              sbom = json.load(stream)
+          assert sbom.get('bomFormat') == 'CycloneDX'
+          assert isinstance(sbom.get('components'), list) and sbom['components']
+          print('CycloneDX SBOM contains', len(sbom['components']), 'components')
+          PY
+      - name: Audit all locked dependencies including dev (fail on high and critical)
+        env:
+          npm_config_audit: 'true'
+        run: npm audit --package-lock-only --include=dev --audit-level=high --json > security-evidence/npm-audit.json
+      - name: Save audit and SBOM as security evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: dependency-evidence
+          path: security-evidence/
+          if-no-files-found: warn
+          retention-days: 14
